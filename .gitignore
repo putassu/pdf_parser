@@ -1,0 +1,28 @@
+# Временные файлы Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Окружение
+.venv/
+venv/
+env/
+.env
+
+# Логи и результаты работы парсера
+*.log
+parsing.log
+structured_results.json
+results.json
+
+# Папки с картинками и выходными данными
+debug_snapshots/
+output/
+debug_images/
+
+# Исходные PDF (чтобы не забивать репозиторий тяжелыми файлами)
+*.pdf
+
+# Системные файлы
+.DS_Store
+Thumbs.db

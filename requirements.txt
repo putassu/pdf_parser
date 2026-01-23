@@ -1,0 +1,5 @@
+pymupdf
+Pillow
+easyocr
+requests
+numpy
