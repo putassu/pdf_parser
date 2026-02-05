@@ -1,202 +1,224 @@
 import openpyxl
 from openpyxl.utils import get_column_letter
-from openpyxl.cell.cell import Cell, MergedCell
 import logging
 import time
+import base64
+import io
 
-# ================= ГЛОБАЛЬНЫЕ НАСТРОЙКИ ПАРСЕРА =================
-H_TOLERANCE = 1          # Разрыв между колонками, чтобы считать их одним блоком
-V_TOLERANCE = 1          # Разрыв между строками, чтобы считать их одним блоком
-MAX_CHARS_BLOCK = 3000   # Лимит символов для анкеты (data_form), выше -> data_table
-MIN_TABLE_ROWS = 10      # Минимальное кол-во строк для потенциальной таблицы
-SHOW_MERGED_MAP = True   # Показывать ли диапазоны [A1:C1] в выводе
-VALIDATION_THRESHOLD = 0.95 # Допустимый % покрытия (0.95 = 95%)
-# ================================================================
+# ================= ГЛОБАЛЬНЫЕ НАСТРОЙКИ ПО УМОЛЧАНИЮ =================
+DEFAULT_PARAMS = {
+    "H_TOLERANCE": 1,
+    "V_TOLERANCE": 1,
+    "MAX_CHARS_BLOCK": 3000,
+    "MIN_TABLE_ROWS": 10,
+    "VALIDATION_THRESHOLD": 0.98,
+    "SHOW_MERGED_MAP": True
+}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("ExcelParser")
+logger = logging.getLogger("SeniorAnalyzer")
+
+def mock_do_vlm(img_data_base64):
+    """Моковая функция VLM: возвращает первые 50 символов base64."""
+    return f"VLM_ANALYSIS: {img_data_base64[:50]}..."
 
 class RobustExcelParser:
-    def __init__(self):
-        pass
+    def __init__(self, **kwargs):
+        self.params = DEFAULT_PARAMS.copy()
+        self.params.update(kwargs)
 
-    def parse_file(self, file_path: str):
-        start_time = time.time()
-        logger.info(f"Processing file: {file_path}")
+    def update_params(self, **kwargs):
+        self.params.update(kwargs)
+
+    def _image_to_base64(self, img):
+        """Конвертация объекта изображения openpyxl в base64 string."""
         try:
-            # data_only=True для значений, read_only=False для стилей (границ)
+            # Картинка лежит в img.ref (объект изображения)
+            # В разных версиях openpyxl доступ может отличаться
+            from PIL import Image
+            image = Image.open(img.ref)
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            return base64.b64encode(buffered.getvalue()).decode('utf-8')
+        except Exception as e:
+            # Если не получилось через PIL, пробуем прочитать байты напрямую, если это возможно
+            try:
+                raw_data = img._data() # Внутренний метод некоторых версий
+                return base64.b64encode(raw_data).decode('utf-8')
+            except:
+                return f"ERROR_LOADING_IMAGE: {str(e)}"
+
+    def parse_file(self, file_path: str, vlm_callback=None):
+        start_time = time.time()
+        logger.info(f"Processing: {file_path}")
+        
+        try:
+            # Открываем для чтения данных и стилей
             wb = openpyxl.load_workbook(file_path, data_only=True)
         except Exception as e:
-            logger.error(f"Failed to open file: {e}")
-            return []
+            return {"error": str(e)}
 
-        results = []
+        manifest = []
         for sheet in wb.worksheets:
-            # Пропускаем совсем пустые листы
-            if sheet.calculate_dimension() == 'A1:A1' and not sheet['A1'].value:
-                continue
-                
-            sheet_data = self._process_sheet(sheet)
-            if sheet_data:
-                results.extend(sheet_data)
-        
-        logger.info(f"Finished in {time.time() - start_time:.2f} seconds")
-        return results
+            sheet_report = self._process_sheet(sheet, vlm_callback)
+            if sheet_report:
+                manifest.append({
+                    "sheet_name": sheet.title,
+                    "data": sheet_report
+                })
 
-    def _process_sheet(self, sheet):
-        # 1. Предварительный сбор всех значимых данных в кэш
-        # Это КРИТИЧЕСКИ ускоряет работу, т.к. мы не дергаем sheet.cell()
-        sig_data = {} # (r, c) -> value
-        total_sig_count = 0
-        
-        # Кэшируем объединенные ячейки
-        merged_lookup = {}
-        for rng in sheet.merged_cells.ranges:
-            for r in range(rng.min_row, rng.max_row + 1):
-                for c in range(rng.min_col, rng.max_col + 1):
-                    merged_lookup[(r, c)] = rng
-
-        # Сканируем лист один раз
-        for row in sheet.iter_rows():
-            for cell in row:
-                if self._is_significant(cell, (cell.row, cell.column) in merged_lookup):
-                    sig_data[(cell.row, cell.column)] = cell.value
-                    total_sig_count += 1
-
-        if not sig_data:
-            return []
-
-        # 2. Кластеризация
-        clusters = self._cluster_regions(list(sig_data.keys()))
-
-        # 3. Анализ и валидация
-        sheet_output = []
-        cells_covered = 0
-        
-        for cluster in clusters:
-            cells_covered += len(cluster)
-            region_info = self._analyze_region(sheet, cluster, sig_data, merged_lookup)
-            region_info['sheet'] = sheet.title
-            sheet_output.append(region_info)
-
-        # Валидация покрытия
-        self.coverage = cells_covered / total_sig_count if total_sig_count > 0 else 1.0
-        if self.coverage < VALIDATION_THRESHOLD:
-            logger.warning(f"Sheet '{sheet.title}': Coverage only {coverage:.2%}. Some cells were orphaned.")
-            # Здесь можно реализовать смену стратегии (например, увеличить толерантность)
-        
-        return sheet_output
+        logger.info(f"Parsing finished in {time.time() - start_time:.2f}s")
+        return manifest
 
     def _is_significant(self, cell, in_merged):
-        """Проверка ячейки на значимость."""
         if cell.value is not None and str(cell.value).strip() != "":
             return True
-        if in_merged: # Любая ячейка в объединении считается значимой для структуры
-            return True
-        if cell.border and any([cell.border.left.style, cell.border.right.style, 
-                                cell.border.top.style, cell.border.bottom.style]):
+        if in_merged: return True
+        b = cell.border
+        if b and (b.left.style or b.right.style or b.top.style or b.bottom.style):
             return True
         if cell.fill and cell.fill.patternType and cell.fill.patternType != 'none':
             return True
         return False
 
+    def _process_sheet(self, sheet, vlm_callback):
+        sig_data = {}
+        merged_lookup = {}
+        
+        for rng in sheet.merged_cells.ranges:
+            for r in range(rng.min_row, rng.max_row + 1):
+                for c in range(rng.min_col, rng.max_col + 1):
+                    merged_lookup[(r, c)] = rng
+
+        for row in sheet.iter_rows():
+            for cell in row:
+                if self._is_significant(cell, (cell.row, cell.column) in merged_lookup):
+                    sig_data[(cell.row, cell.column)] = cell.value
+
+        if not sig_data: return None
+
+        # Обработка изображений
+        images_results = []
+        if hasattr(sheet, '_images') and sheet._images:
+            for img in sheet._images:
+                b64_str = self._image_to_base64(img)
+                analysis = vlm_callback(b64_str) if vlm_callback else "No VLM callback"
+                
+                # Вместо объекта Anchor сохраняем строку, чтобы не было ошибки repr
+                anchor_pos = "Unknown"
+                if hasattr(img, 'anchor'):
+                    # Обычно это объект TwoCellAnchor или OneCellAnchor
+                    try:
+                        anchor_pos = f"{get_column_letter(img.anchor._from.col + 1)}{img.anchor._from.row + 1}"
+                    except:
+                        anchor_pos = str(img.anchor)
+
+                images_results.append({
+                    "anchor": anchor_pos,
+                    "vlm_res": analysis
+                })
+
+        # Кластеризация
+        clusters = self._cluster_regions(list(sig_data.keys()))
+        
+        regions = []
+        cells_covered = 0
+        for cluster in clusters:
+            cells_covered += len(cluster)
+            reg = self._analyze_region(sheet, cluster, sig_data, merged_lookup)
+            regions.append(reg)
+
+        coverage = cells_covered / len(sig_data)
+        if coverage < self.params["VALIDATION_THRESHOLD"]:
+            logger.warning(f"Low coverage ({coverage:.2%}) on {sheet.title}")
+
+        return {
+            "regions": regions, 
+            "images": images_results, 
+            "coverage": coverage
+        }
+
     def _cluster_regions(self, coords):
         coords_set = set(coords)
-        clusters = []
         visited = set()
-        
-        # Сортировка ускоряет BFS за счет локальности данных
+        clusters = []
         sorted_coords = sorted(coords)
 
-        for start_node in sorted_coords:
-            if start_node in visited:
-                continue
-
-            cluster = []
-            queue = [start_node]
-            visited.add(start_node)
-            
+        for node in sorted_coords:
+            if node in visited: continue
+            cluster, queue = [], [node]
+            visited.add(node)
             while queue:
                 r, c = queue.pop(0)
                 cluster.append((r, c))
-
-                # Поиск соседей в окне толерантности
-                for nr in range(r - V_TOLERANCE, r + V_TOLERANCE + 1):
-                    for nc in range(c - H_TOLERANCE, c + H_TOLERANCE + 1):
+                for nr in range(r - self.params["V_TOLERANCE"], r + self.params["V_TOLERANCE"] + 1):
+                    for nc in range(c - self.params["H_TOLERANCE"], c + self.params["H_TOLERANCE"] + 1):
                         neighbor = (nr, nc)
                         if neighbor in coords_set and neighbor not in visited:
-                            visited.add(neighbor)
-                            queue.append(neighbor)
+                            visited.add(neighbor); queue.append(neighbor)
             clusters.append(cluster)
         return clusters
 
-    def _analyze_region(self, sheet, cluster_coords, sig_data_cache, merged_lookup):
-        rows = [c[0] for c in cluster_coords]
-        cols = [c[1] for c in cluster_coords]
+    def _analyze_region(self, sheet, cluster_coords, sig_data, merged_lookup):
+        rows, cols = [c[0] for c in cluster_coords], [c[1] for c in cluster_coords]
         min_r, max_r, min_c, max_c = min(rows), max(rows), min(cols), max(cols)
         
-        # Сбор строк
         lines = []
         for r in range(min_r, max_r + 1):
-            row_cells = []
-            processed_in_row = set()
-            
+            row_parts, skip_cols = [], set()
             for c in range(min_c, max_c + 1):
-                if c in processed_in_row: continue
-                
+                if c in skip_cols: continue
                 coord = (r, c)
-                val = sig_data_cache.get(coord)
-                
-                # Обработка Merged Cells
                 if coord in merged_lookup:
-                    m_rng = merged_lookup[coord]
-                    # Берем значение только из верхней левой ячейки
-                    if r == m_rng.min_row and c == m_rng.min_col:
-                        addr = str(m_rng) if SHOW_MERGED_MAP else get_column_letter(c)+str(r)
-                        display_val = str(val).strip() if val is not None else ""
-                        row_cells.append(f"[{addr}]: {display_val}")
-                    
-                    # Помечаем все колонки этого объединения в текущей строке как обработанные
-                    for mc in range(m_rng.min_col, m_rng.max_col + 1):
-                        processed_in_row.add(mc)
+                    m = merged_lookup[coord]
+                    if r == m.min_row and c == m.min_col:
+                        val = sig_data.get(coord, "")
+                        addr = str(m) if self.params["SHOW_MERGED_MAP"] else f"{get_column_letter(c)}{r}"
+                        row_parts.append(f"[{addr}]: {str(val).strip()}")
+                    for col_idx in range(m.min_col, m.max_col + 1): skip_cols.add(col_idx)
                 else:
-                    if val is not None and str(val).strip() != "":
-                        row_cells.append(f"[{get_column_letter(c)}{r}]: {str(val).strip()}")
-            
-            if row_cells:
-                lines.append(" | ".join(row_cells))
+                    val = sig_data.get(coord)
+                    if val is not None:
+                        row_parts.append(f"[{get_column_letter(c)}{r}]: {str(val).strip()}")
+            if row_parts: lines.append(" | ".join(row_parts))
 
-        # Формирование превью
-        total_lines = len(lines)
-        full_text = "\n".join(lines)
-        
-        if len(full_text) > MAX_CHARS_BLOCK and total_lines > MIN_TABLE_ROWS:
-            # Режим TABLE
-            head = lines[:5]
-            tail = lines[-5:]
-            skipped_count = total_lines - 10
-            preview = "\n".join(head) + f"\n... [DATA SKIPPED: {skipped_count} ROWS] ...\n" + "\n".join(tail)
-            r_type = "data_table"
+        is_table = len("\n".join(lines)) > self.params["MAX_CHARS_BLOCK"] and len(lines) > self.params["MIN_TABLE_ROWS"]
+        if is_table:
+            preview = "\n".join(lines[:5]) + f"\n... [SKIPPED {len(lines)-10} ROWS] ...\n" + "\n".join(lines[-5:])
+            res_type = "data_table"
         else:
-            # Режим FORM
-            preview = full_text
-            r_type = "data_form"
+            preview = "\n".join(lines); res_type = "data_form"
 
         return {
-            "type": r_type,
+            "type": res_type,
             "range": f"{get_column_letter(min_c)}{min_r}:{get_column_letter(max_c)}{max_r}",
-            "preview": preview,
-            "coverage_cells": len(cluster_coords)
+            "preview": preview
         }
 
-# --- TEST ---
+# --- КРАСИВЫЙ ВЫВОД И ТЕСТ ---
+
 if __name__ == "__main__":
-    parser = RobustExcelParser()
-    # Укажи путь к своему файлу
-    results = parser.parse_file("C:\\Users\\sigur\\docling\\xlsx_parser\\Анкета_соискателя_на_вакантную_должность_1_1 (3) — копия (2).xlsx")
+    # Можно менять параметры прямо здесь
+    parser = RobustExcelParser(V_TOLERANCE=1, H_TOLERANCE=1)
     
-    for r in results:
-        print(f"--- Region ({r['type']}) {r['range']} (Sheet: {r['sheet']}) ---")
-        print(r['preview'])
-        print("-" * 50 + "\n")
-        print(parser.coverage)
+    file_path = r"C:\\Users\\sigur\\docling\\xlsx_parser\\Анкета_соискателя_на_вакантную_должность_1_1 (3) — копия (2).xlsx"
+    results = parser.parse_file(file_path, vlm_callback=mock_do_vlm)
+
+    for sheet_data in results:
+        s_name = sheet_data['sheet_name']
+        data = sheet_data['data']
+        
+        print(f"\n{'='*30} SHEET: {s_name} (Cov: {data['coverage']:.2%}) {'='*30}")
+        
+        # Вывод регионов
+        for r in data['regions']:
+            print(f"\n--- Region ({r['type']}) {r['range']} ---")
+            print(r['preview'])
+            print("-" * 60)
+            
+        # Вывод изображений
+        if data['images']:
+            print(f"\nFound {len(data['images'])} image(s):")
+            for img in data['images']:
+                print(f"  • Position {img['anchor']}: {img['vlm_res']}")
+
