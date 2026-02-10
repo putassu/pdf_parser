@@ -1,0 +1,96 @@
+import subprocess
+import tempfile
+import asyncio
+from pathlib import Path
+import os
+import shutil
+ 
+
+def convert_presentation_to_pdf(input_path: str) -> str:
+    """
+    Конвертирует .ppt/.pptx в .pdf с помощью LibreOffice.
+    Полностью повторяет логику convert_doc_to_docx со скриншота.
+    """
+    libreoffice = get_libreoffice_path()
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cmd = [
+            libreoffice,
+            "--headless",
+            "--invisible",
+            "--convert-to", "pdf",
+            "--outdir", tmp_dir,
+            input_path
+        ]
+        
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=60 # PPT конвертируются дольше, лучше дать больше времени
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("LibreOffice не ответил за 60 секунд при конвертации PPT")
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(f"Ошибка LibreOffice: {stderr}")
+
+        # LibreOffice сохраняет файл с тем же именем, но расширением pdf
+        output_filename = Path(input_path).stem + ".pdf"
+        output_path = Path(tmp_dir) / output_filename
+
+        if not output_path.exists():
+            raise RuntimeError("Файл .pdf не был создан")
+
+        # Копируем файл из временной папки (которая удалится) в постоянную временную папку
+        final_path = Path(tempfile.gettempdir()) / f"converted_{output_filename}"
+        
+        with open(output_path, "rb") as src, open(final_path, "wb") as dst:
+            dst.write(src.read())
+            
+        return str(final_path)
+
+def convert_xls_to_xlsx(input_path: str) -> str:
+    """
+    Конвертирует старый .xls в новый .xlsx.
+    """
+    libreoffice = get_libreoffice_path()
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cmd = [
+            libreoffice,
+            "--headless",
+            "--invisible",
+            "--convert-to", "xlsx",
+            "--outdir", tmp_dir,
+            input_path
+        ]
+        
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=45
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("LibreOffice не ответил за 45 секунд при конвертации XLS")
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(f"Ошибка LibreOffice: {stderr}")
+
+        output_filename = Path(input_path).stem + ".xlsx"
+        output_path = Path(tmp_dir) / output_filename
+
+        if not output_path.exists():
+            raise RuntimeError("Файл .xlsx не был создан")
+
+        final_path = Path(tempfile.gettempdir()) / output_filename
+        
+        with open(output_path, "rb") as src, open(final_path, "wb") as dst:
+            dst.write(src.read())
+            
+        return str(final_path)
